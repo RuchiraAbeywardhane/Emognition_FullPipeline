@@ -370,7 +370,7 @@ class _Config:
     MODE = "cleaned"
 
     # Baseline reduction
-    USE_BASELINE_REDUCTION = False   # Set True to enable InvBase
+    USE_BASELINE_REDUCTION = True   # Set True to enable InvBase
 
     # Split strategy — pick ONE
     SUBJECT_INDEPENDENT = True
