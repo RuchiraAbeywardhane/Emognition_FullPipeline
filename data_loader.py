@@ -1,28 +1,9 @@
 """
 EEG Data Loader Module — Emognition Dataset
 ============================================================
-Unified loader supporting both RAW and CLEANED versions of
-the Emognition dataset.
-
-Dataset Modes
--------------
-  raw     : Original JSON files straight from the MUSE headband.
-            Includes HSI / HeadBandOn quality columns and raw
-            per-sample timestamps.  Baseline reduction is NOT
-            applied here — use baseline_reduction.py separately.
-
-  cleaned : Pre-processed CSV/JSON files that have already had
-            artefact removal applied upstream.  Feature extraction
-            is delegated to eeg_feature_extractor.py.
-
-Features
---------
-  - MUSE headband EEG data loading from JSON files (raw mode)
-  - CSV loading for cleaned data
-  - Quality filtering (HSI, HeadBandOn) — raw mode only
-  - Windowing with configurable overlap
-  - 26-feature extraction per channel (DE, PSD, temporal stats …)
-  - Subject-independent, clip-independent, and random data splits
+Loads MUSE EEG JSON files, applies quality filtering,
+optional baseline reduction (InvBase), windowing, and
+feature extraction.
 
 Author : Final Year Project
 Date   : 2026
@@ -34,17 +15,16 @@ import os
 import glob
 import json
 from collections import Counter
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from scipy.stats import skew, kurtosis
 
 # ---------------------------------------------------------------------------
-# Optional dependency — only needed in 'cleaned' mode
+# Optional external feature extractor
 # ---------------------------------------------------------------------------
 try:
-    from eeg_feature_extractor import extract_eeg_features as _external_extract
+    from eeg_feature_extractor import extract_eeg_features
     _HAS_EXTRACTOR = True
 except ImportError:
     _HAS_EXTRACTOR = False
@@ -52,14 +32,9 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-MUSE_EEG_COLS   = ["RAW_TP9", "RAW_AF7", "RAW_AF8", "RAW_TP10"]
-MUSE_HSI_COLS   = ["HSI_TP9", "HSI_AF7", "HSI_AF8", "HSI_TP10"]
-DEFAULT_FS      = 256.0          # Hz — MUSE default sample rate
-DEFAULT_WIN_SEC = 4.0            # seconds per window
-DEFAULT_OVERLAP = 0.5            # 50 % overlap
-LABEL_COL       = "label"
-SUBJECT_COL     = "subject_id"
-TRIAL_COL       = "trial_id"
+EEG_COLS = ["RAW_TP9", "RAW_AF7", "RAW_AF8", "RAW_TP10"]
+HSI_COLS = ["HSI_TP9", "HSI_AF7", "HSI_AF8", "HSI_TP10"]
+
 
 # ===========================================================================
 # UTILITY FUNCTIONS
@@ -67,39 +42,35 @@ TRIAL_COL       = "trial_id"
 
 def _to_num(x) -> np.ndarray:
     """Convert various input types to a float64 numpy array."""
+    if isinstance(x, list):
+        if not x:
+            return np.array([], dtype=np.float64)
+        if isinstance(x[0], str):
+            return pd.to_numeric(pd.Series(x), errors="coerce").to_numpy(np.float64)
+        return np.asarray(x, dtype=np.float64)
     if isinstance(x, np.ndarray):
         return x.astype(np.float64)
     if isinstance(x, pd.Series):
         return x.to_numpy(dtype=np.float64)
-    return np.array(x, dtype=np.float64)
+    return np.asarray([x], dtype=np.float64)
 
 
 def _interp_nan(a: np.ndarray) -> np.ndarray:
-    """
-    Linearly interpolate NaN values in a 1-D array.
-    Edge NaNs are forward/back filled.
-    """
-    a = a.copy()
-    nans = np.isnan(a)
-    if not nans.any():
+    """Linearly interpolate NaN / Inf values in a 1-D array."""
+    a = a.astype(np.float64, copy=True)
+    m = np.isfinite(a)
+    if m.all():
         return a
+    if not m.any():
+        return np.zeros_like(a)
     idx = np.arange(len(a))
-    a[nans] = np.interp(idx[nans], idx[~nans], a[~nans])
+    a[~m] = np.interp(idx[~m], idx[m], a[m])
     return a
 
 
 def check_json_structure(data_root: str, num_samples: int = 3) -> None:
-    """
-    Print the top-level structure of a few JSON files in *data_root*.
-    Useful for debugging / understanding new dataset formats.
-
-    Parameters
-    ----------
-    data_root   : Root directory that contains the JSON files.
-    num_samples : How many files to inspect.
-    """
-    pattern = os.path.join(data_root, "**", "*.json")
-    files   = glob.glob(pattern, recursive=True)[:num_samples]
+    """Print the top-level structure of a few JSON files — useful for debugging."""
+    files = sorted(glob.glob(os.path.join(data_root, "**", "*.json"), recursive=True))[:num_samples]
     if not files:
         print(f"[check_json_structure] No JSON files found under '{data_root}'.")
         return
@@ -109,491 +80,315 @@ def check_json_structure(data_root: str, num_samples: int = 3) -> None:
         print(f"\n--- {fp} ---")
         if isinstance(data, dict):
             for k, v in data.items():
-                vtype = type(v).__name__
-                vlen  = len(v) if hasattr(v, "__len__") else "scalar"
-                print(f"  key='{k}'  type={vtype}  len={vlen}")
+                vlen = len(v) if hasattr(v, "__len__") else "scalar"
+                print(f"  key='{k}'  type={type(v).__name__}  len={vlen}")
         elif isinstance(data, list):
-            print(f"  list of {len(data)} items; first item keys: "
+            print(f"  list of {len(data)} items; first item: "
                   f"{list(data[0].keys()) if isinstance(data[0], dict) else type(data[0])}")
         else:
             print(f"  type={type(data)}")
 
 
 # ===========================================================================
-# QUALITY FILTERING  (raw mode only)
+# BASELINE REDUCTION  (InvBase)
 # ===========================================================================
 
-def _apply_quality_filter(df: pd.DataFrame, hsi_threshold: int = 2) -> pd.DataFrame:
-    """
-    Remove samples where the MUSE headband contact quality is poor.
-
-    Parameters
-    ----------
-    df            : Raw DataFrame with HSI_* and HeadBandOn columns.
-    hsi_threshold : Samples with any HSI value > threshold are dropped.
-                    MUSE HSI: 1 = good, 2 = ok, 4 = bad.
-    """
-    mask = pd.Series(True, index=df.index)
-
-    if "HeadBandOn" in df.columns:
-        mask &= df["HeadBandOn"].astype(float) == 1.0
-
-    present_hsi = [c for c in MUSE_HSI_COLS if c in df.columns]
-    for col in present_hsi:
-        mask &= df[col].astype(float) <= hsi_threshold
-
-    dropped = (~mask).sum()
-    if dropped > 0:
-        print(f"  [quality filter] dropped {dropped}/{len(df)} samples.")
-    return df[mask].reset_index(drop=True)
-
-
-# ===========================================================================
-# WINDOWING
-# ===========================================================================
-
-def _make_windows(
+def apply_baseline_reduction(
     signal: np.ndarray,
-    fs: float,
-    win_sec: float,
-    overlap: float,
-) -> np.ndarray:
-    """
-    Slice a (T, C) signal into overlapping windows.
-
-    Parameters
-    ----------
-    signal  : Array of shape (T, C).
-    fs      : Sampling frequency in Hz.
-    win_sec : Window length in seconds.
-    overlap : Fractional overlap [0, 1).
-
-    Returns
-    -------
-    windows : Array of shape (N, win_samples, C).
-    """
-    win_samples  = int(win_sec * fs)
-    step_samples = int(win_samples * (1.0 - overlap))
-    if step_samples < 1:
-        step_samples = 1
-
-    T      = signal.shape[0]
-    starts = range(0, T - win_samples + 1, step_samples)
-
-    if not list(starts):
-        return np.empty((0, win_samples, signal.shape[1]), dtype=signal.dtype)
-
-    windows = np.stack([signal[s : s + win_samples] for s in starts], axis=0)
-    return windows  # (N, W, C)
-
-
-# ===========================================================================
-# FEATURE EXTRACTION  (raw mode — 26 features per channel)
-# ===========================================================================
-
-def _bandpower(x: np.ndarray, fs: float, lo: float, hi: float, eps: float) -> float:
-    """Estimate band power via FFT."""
-    N    = len(x)
-    fft  = np.fft.rfft(x, n=N)
-    freq = np.fft.rfftfreq(N, d=1.0 / fs)
-    idx  = np.where((freq >= lo) & (freq < hi))[0]
-    if len(idx) == 0:
-        return eps
-    power = (np.abs(fft[idx]) ** 2).mean()
-    return float(power) + eps
-
-
-def extract_eeg_features(
-    X_raw: np.ndarray,
-    config: dict,
-    fs: float = DEFAULT_FS,
+    baseline: np.ndarray,
     eps: float = 1e-12,
 ) -> np.ndarray:
     """
-    Extract 26 features per channel from EEG windows.
+    Apply InvBase baseline reduction.
+
+    Divides the trial FFT by the baseline FFT per channel, then converts
+    back to the time domain.
 
     Parameters
     ----------
-    X_raw  : Array of shape (N, W, C) — N windows, W samples, C channels.
-    config : Pipeline config dict (uses 'fs' key if present).
-    fs     : Sampling rate (overridden by config['fs'] if set).
-    eps    : Small constant for numerical stability.
+    signal   : (T, C) trial signal.
+    baseline : (T, C) resting-state baseline (same length as signal).
+    eps      : Small constant to prevent division by zero.
 
     Returns
     -------
-    X_feat : Array of shape (N, C * 26).
+    reduced  : (T, C) float32 array.
     """
-    if _HAS_EXTRACTOR:
-        return _external_extract(X_raw, config, fs=fs, eps=eps)
-
-    fs = float(config.get("fs", fs))
-
-    bands = {
-        "delta": (0.5,  4.0),
-        "theta": (4.0,  8.0),
-        "alpha": (8.0,  13.0),
-        "beta":  (13.0, 30.0),
-        "gamma": (30.0, 45.0),
-    }
-
-    N, W, C = X_raw.shape
-    features = []
-
-    for n in range(N):
-        win_feats = []
-        for c in range(C):
-            x = _interp_nan(_to_num(X_raw[n, :, c]))
-
-            # --- Spectral features (5 bands × 2 = 10) ---
-            psd, de = [], []
-            for lo, hi in bands.values():
-                bp = _bandpower(x, fs, lo, hi, eps)
-                psd.append(bp)
-                de.append(0.5 * np.log(2 * np.pi * np.e * bp))
-
-            # --- Temporal features (16) ---
-            mean_v   = float(np.mean(x))
-            std_v    = float(np.std(x))
-            var_v    = float(np.var(x))
-            rms_v    = float(np.sqrt(np.mean(x ** 2)))
-            skew_v   = float(skew(x))
-            kurt_v   = float(kurtosis(x))
-            p2p_v    = float(np.ptp(x))
-            zcr_v    = float(((x[:-1] * x[1:]) < 0).sum()) / W
-            energy   = float(np.sum(x ** 2))
-            mob_v    = float(np.std(np.diff(x)) / (std_v + eps))
-            comp_v   = float(
-                np.std(np.diff(np.diff(x))) / (np.std(np.diff(x)) + eps)
-            )
-            q25, q75 = np.percentile(x, [25, 75])
-            iqr_v    = float(q75 - q25)
-            max_v    = float(np.max(x))
-            min_v    = float(np.min(x))
-            median_v = float(np.median(x))
-            snr_v    = float(mean_v / (std_v + eps))
-
-            temporal = [
-                mean_v, std_v, var_v, rms_v, skew_v, kurt_v,
-                p2p_v, zcr_v, energy, mob_v, comp_v, iqr_v,
-                max_v, min_v, median_v, snr_v,
-            ]
-
-            win_feats.extend(psd)       # 5
-            win_feats.extend(de)        # 5
-            win_feats.extend(temporal)  # 16
-            # total per channel = 26
-
-        features.append(win_feats)
-
-    return np.array(features, dtype=np.float32)  # (N, C*26)
+    fft_trial    = np.fft.rfft(signal,   axis=0)
+    fft_baseline = np.fft.rfft(baseline, axis=0)
+    fft_reduced  = fft_trial / (np.abs(fft_baseline) + eps)
+    reduced      = np.fft.irfft(fft_reduced, n=len(signal), axis=0)
+    return reduced.astype(np.float32)
 
 
-# ===========================================================================
-# JSON LOADING HELPERS  (raw mode)
-# ===========================================================================
-
-def _load_single_json(filepath: str, config: dict) -> Optional[pd.DataFrame]:
+def _load_baseline_files(files: list, data_root: str) -> dict:
     """
-    Load a single MUSE JSON recording into a DataFrame.
+    Load per-subject baseline recordings.
 
-    Expected JSON formats
-    ---------------------
-    1. A dict with a 'data' key whose value is a list of sample dicts.
-    2. A plain list of sample dicts.
-    3. A dict whose values are lists (column-oriented) — equal or unequal lengths.
+    Parameters
+    ----------
+    files     : All recording file paths (used to discover subjects).
+    data_root : Dataset root directory.
+
+    Returns
+    -------
+    baseline_dict : { subject_id : (T, 4) float32 array }
     """
-    with open(filepath, "r") as fh:
-        raw = json.load(fh)
+    baseline_dict = {}
+    print("   Loading baseline recordings...")
 
-    if isinstance(raw, dict) and "data" in raw:
-        df = pd.DataFrame(raw["data"])
-    elif isinstance(raw, list):
-        df = pd.DataFrame(raw)
-    elif isinstance(raw, dict):
-        # Column-oriented: truncate all columns to the shortest list length
-        # to handle unequal length arrays gracefully
-        col_lengths = {k: len(v) for k, v in raw.items() if isinstance(v, list)}
-        if col_lengths:
-            min_len = min(col_lengths.values())
-            truncated = {k: (v[:min_len] if isinstance(v, list) else v)
-                         for k, v in raw.items()}
-            df = pd.DataFrame(truncated)
-        else:
-            df = pd.DataFrame([raw])  # scalar values — wrap as single row
-    else:
-        print(f"  [warning] Unrecognised JSON format in '{filepath}' — skipping.")
-        return None
-
-    keep     = MUSE_EEG_COLS + MUSE_HSI_COLS
-    optional = ["HeadBandOn", "TimeStamp", LABEL_COL, SUBJECT_COL, TRIAL_COL]
-    keep    += [c for c in optional if c in df.columns]
-    df       = df[[c for c in keep if c in df.columns]]
-
-    for col in MUSE_EEG_COLS:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    return df
-
-
-def _parse_meta_from_path(filepath: str) -> Dict[str, str]:
-    """
-    Infer subject_id and trial_id from the file path when they are
-    not embedded in the JSON itself.
-
-    Expected structure:
-        …/<subject_id>/<trial_id>.json
-    """
-    parts = filepath.replace("\\", "/").split("/")
-    meta  = {}
-    if len(parts) >= 2:
-        meta[SUBJECT_COL] = parts[-2]
-        meta[TRIAL_COL]   = os.path.splitext(parts[-1])[0]
-    return meta
-
-
-# ===========================================================================
-# MAIN DATA LOADING — RAW MODE
-# ===========================================================================
-
-def _load_raw(data_root: str, config: dict) -> Tuple[
-    np.ndarray, np.ndarray, np.ndarray, np.ndarray
-]:
-    """Load raw MUSE JSON files → (X_windows, y_labels, subject_ids, trial_ids)."""
-    fs           = float(config.get("fs",             DEFAULT_FS))
-    win_sec      = float(config.get("win_sec",        DEFAULT_WIN_SEC))
-    overlap      = float(config.get("overlap",        DEFAULT_OVERLAP))
-    hsi_thresh   = int(  config.get("hsi_threshold",  2))
-    quality_filt = bool( config.get("quality_filter", True))
-    label_map    = config.get("label_map", None)
-    baseline_kw  = config.get("baseline_keyword", "baseline")
-
-    pattern = os.path.join(data_root, "**", "*.json")
-    files   = sorted(glob.glob(pattern, recursive=True))
-    files   = [f for f in files
-               if baseline_kw.lower() not in os.path.basename(f).lower()]
-
-    if not files:
-        raise FileNotFoundError(
-            f"No JSON files found under '{data_root}' "
-            f"(excluding files containing '{baseline_kw}')."
-        )
-
-    print(f"[load_raw] Found {len(files)} recording file(s).")
-
-    all_windows, all_labels, all_subjects, all_trials = [], [], [], []
-
-    for fp in files:
-        df = _load_single_json(fp, config)
-        if df is None:
+    for fpath in files:
+        fname   = os.path.basename(fpath)
+        parts   = fname.split("_")
+        if len(parts) < 2:
+            continue
+        subject = parts[0]
+        if subject in baseline_dict or "BASELINE" in fname.upper():
             continue
 
-        meta = _parse_meta_from_path(fp)
-        if SUBJECT_COL not in df.columns:
-            df[SUBJECT_COL] = meta.get(SUBJECT_COL, "unknown")
-        if TRIAL_COL not in df.columns:
-            df[TRIAL_COL] = meta.get(TRIAL_COL, "unknown")
+        candidates = [
+            os.path.join(data_root, f"{subject}_BASELINE_STIMULUS_MUSE.json"),
+            os.path.join(data_root, subject,
+                         f"{subject}_BASELINE_STIMULUS_MUSE.json"),
+            os.path.join(data_root, subject,
+                         f"{subject}_BASELINE_STIMULUS_MUSE_cleaned",
+                         f"{subject}_BASELINE_STIMULUS_MUSE_cleaned.json"),
+        ]
 
-        subject_id = str(df[SUBJECT_COL].iloc[0])
-        trial_id   = str(df[TRIAL_COL].iloc[0])
-
-        if LABEL_COL in df.columns:
-            raw_label = df[LABEL_COL].iloc[0]
-        else:
-            raw_label = meta.get(TRIAL_COL, "unknown")
-
-        label = label_map.get(str(raw_label), -1) if label_map is not None else raw_label
-
-        if quality_filt:
-            df = _apply_quality_filter(df, hsi_threshold=hsi_thresh)
-
-        if df.empty:
-            print(f"  [skip] '{fp}' — empty after quality filter.")
-            continue
-
-        eeg_cols = [c for c in MUSE_EEG_COLS if c in df.columns]
-        if not eeg_cols:
-            print(f"  [skip] '{fp}' — no EEG columns found.")
-            continue
-
-        signal  = np.stack(
-            [_interp_nan(_to_num(df[c].values)) for c in eeg_cols], axis=-1
-        )
-        windows = _make_windows(signal, fs, win_sec, overlap)
-
-        if windows.shape[0] == 0:
-            print(f"  [skip] '{fp}' — signal too short for even one window.")
-            continue
-
-        n_win = windows.shape[0]
-        all_windows.append(windows)
-        all_labels.extend([label]      * n_win)
-        all_subjects.extend([subject_id] * n_win)
-        all_trials.extend([trial_id]   * n_win)
-
-        print(f"  loaded '{os.path.basename(fp)}'  "
-              f"subject={subject_id}  label={label}  windows={n_win}")
-
-    if not all_windows:
-        raise ValueError("No windows could be extracted from any file.")
-
-    X = np.concatenate(all_windows, axis=0)
-    y = np.array(all_labels)
-    s = np.array(all_subjects)
-    t = np.array(all_trials)
-
-    print(f"\n[load_raw] Total windows : {X.shape[0]}")
-    print(f"           Window shape  : {X.shape[1:]}")
-    print(f"           Label dist    : {Counter(y.tolist())}")
-
-    return X, y, s, t
-
-
-# ===========================================================================
-# MAIN DATA LOADING — CLEANED MODE
-# ===========================================================================
-
-def _load_cleaned(data_root: str, config: dict) -> Tuple[
-    np.ndarray, np.ndarray, np.ndarray, np.ndarray
-]:
-    """
-    Load pre-processed CSV/JSON files → (X_features, y_labels,
-    subject_ids, trial_ids).
-
-    Expected CSV schema
-    -------------------
-    Columns: subject_id, trial_id, label, feat_0, feat_1, … feat_N
-    OR:       subject_id, trial_id, label, RAW_TP9, RAW_AF7, RAW_AF8, RAW_TP10
-
-    If raw EEG columns are present, windowing + feature extraction are applied.
-    """
-    fs        = float(config.get("fs",      DEFAULT_FS))
-    win_sec   = float(config.get("win_sec", DEFAULT_WIN_SEC))
-    overlap   = float(config.get("overlap", DEFAULT_OVERLAP))
-    label_map = config.get("label_map", None)
-    baseline_kw = config.get("baseline_keyword", "baseline")
-
-    csv_files  = sorted(glob.glob(os.path.join(data_root, "**", "*.csv"),  recursive=True))
-    json_files = sorted(glob.glob(os.path.join(data_root, "**", "*.json"), recursive=True))
-    files = csv_files + json_files
-    files = [f for f in files
-             if baseline_kw.lower() not in os.path.basename(f).lower()]
-
-    if not files:
-        raise FileNotFoundError(f"No CSV/JSON files found under '{data_root}'.")
-
-    print(f"[load_cleaned] Found {len(files)} file(s).")
-
-    all_X, all_y, all_s, all_t = [], [], [], []
-
-    for fp in files:
-        ext = os.path.splitext(fp)[1].lower()
-        if ext == ".csv":
-            df = pd.read_csv(fp)
-        else:
-            with open(fp, "r") as fh:
-                raw = json.load(fh)
-            df = pd.DataFrame(raw if isinstance(raw, list) else raw.get("data", raw))
-
-        meta       = _parse_meta_from_path(fp)
-        subject_id = str(df[SUBJECT_COL].iloc[0]) if SUBJECT_COL in df.columns \
-                     else meta.get(SUBJECT_COL, "unknown")
-        trial_id   = str(df[TRIAL_COL].iloc[0])   if TRIAL_COL   in df.columns \
-                     else meta.get(TRIAL_COL, "unknown")
-        raw_label  = df[LABEL_COL].iloc[0]         if LABEL_COL   in df.columns \
-                     else meta.get(TRIAL_COL, "unknown")
-        label      = label_map.get(str(raw_label), -1) if label_map else raw_label
-
-        drop_cols = [SUBJECT_COL, TRIAL_COL, LABEL_COL,
-                     "HeadBandOn", "TimeStamp"] + MUSE_HSI_COLS
-        feat_df   = df.drop(columns=[c for c in drop_cols if c in df.columns])
-        eeg_cols  = [c for c in MUSE_EEG_COLS if c in feat_df.columns]
-
-        if eeg_cols:
-            signal  = np.stack(
-                [_interp_nan(_to_num(feat_df[c].values)) for c in eeg_cols], axis=-1
-            )
-            windows = _make_windows(signal, fs, win_sec, overlap)
-            if windows.shape[0] == 0:
-                print(f"  [skip] '{fp}' — signal too short.")
+        for bp in candidates:
+            if not os.path.exists(bp):
                 continue
-            X_file = extract_eeg_features(windows, config, fs=fs)
-            n_win  = X_file.shape[0]
-        else:
-            X_file = feat_df.apply(pd.to_numeric, errors="coerce").fillna(0).values
-            X_file = X_file.astype(np.float32)
-            n_win  = X_file.shape[0]
+            try:
+                with open(bp, "r") as fh:
+                    data = json.load(fh)
+                channels = [
+                    _interp_nan(_to_num(data.get(c, [])))
+                    for c in EEG_COLS
+                ]
+                L = min(len(ch) for ch in channels)
+                if L == 0:
+                    break
+                sig = np.stack([ch[:L] for ch in channels], axis=1).astype(np.float32)
+                sig -= np.nanmean(sig, axis=0, keepdims=True)
+                baseline_dict[subject] = sig
+            except Exception as exc:
+                print(f"   [warning] baseline load failed for {subject}: {exc}")
+            break  # stop after first match
 
-        all_X.append(X_file)
-        all_y.extend([label]      * n_win)
-        all_s.extend([subject_id] * n_win)
-        all_t.extend([trial_id]   * n_win)
-
-        print(f"  loaded '{os.path.basename(fp)}'  "
-              f"subject={subject_id}  label={label}  rows={n_win}")
-
-    if not all_X:
-        raise ValueError("No data could be loaded from any file.")
-
-    X = np.concatenate(all_X, axis=0)
-    y = np.array(all_y)
-    s = np.array(all_s)
-    t = np.array(all_t)
-
-    print(f"\n[load_cleaned] Total samples : {X.shape[0]}")
-    print(f"               Feature dim   : {X.shape[1]}")
-    print(f"               Label dist    : {Counter(y.tolist())}")
-
-    return X, y, s, t
+    print(f"   Loaded {len(baseline_dict)} baseline recording(s).")
+    return baseline_dict
 
 
 # ===========================================================================
-# PUBLIC ENTRY POINT
+# MAIN DATA LOADER
 # ===========================================================================
 
 def load_eeg_data(
     data_root: str,
-    config: dict,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    config,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
     """
-    Unified EEG data loader for the Emognition dataset.
+    Load MUSE EEG recordings from *data_root*.
 
     Parameters
     ----------
     data_root : Path to the dataset root directory.
-    config    : Configuration dictionary.  Key options:
+    config    : Config object **or** dict.  Expected attributes / keys:
 
-        mode             (str)   'raw' or 'cleaned'   [default: 'raw']
-        fs               (float) Sampling rate in Hz   [default: 256.0]
-        win_sec          (float) Window length (s)     [default: 4.0]
-        overlap          (float) Window overlap [0,1)  [default: 0.5]
-        quality_filter   (bool)  Apply HSI filter      [default: True]  raw only
-        hsi_threshold    (int)   Max HSI value (1–4)   [default: 2]     raw only
-        baseline_keyword (str)   Keyword to skip
-                                 baseline files        [default: 'baseline']
-        label_map        (dict)  Map string→int labels [default: None]
+        EEG_FS                  (float) Sampling rate in Hz        [256.0]
+        EEG_WINDOW_SEC          (float) Window length in seconds   [4.0]
+        EEG_OVERLAP             (float) Window overlap [0, 1)      [0.5]
+        USE_BASELINE_REDUCTION  (bool)  Apply InvBase reduction    [False]
+        SUPERCLASS_MAP          (dict)  emotion_str → class_str
+        MODE                    (str)   'raw' | 'cleaned'          ['cleaned']
+        SUBJECT_INDEPENDENT     (bool)  (used downstream)
+        CLIP_INDEPENDENT        (bool)  (used downstream)
 
     Returns
     -------
-    X            : raw mode  → (N, W, C) windows
-                   cleaned   → (N, F)    feature matrix
-    y_labels     : (N,) label array
-    subject_ids  : (N,) subject identifier array
-    trial_ids    : (N,) trial identifier array
-
-    Notes
-    -----
-    * Baseline reduction is intentionally NOT performed here.
-      Use ``baseline_reduction.py`` before calling this function if needed.
-    * In 'raw' mode call ``extract_eeg_features(X, config)`` to get features.
+    X_raw       : (N, W, 4)  raw EEG windows  float32
+    y_labels    : (N,)       integer class labels
+    subject_ids : (N,)       subject identifier strings
+    trial_ids   : (N,)       trial identifier strings  (<subject>_<emotion>)
+    label_to_id : dict       class_name → integer
     """
-    mode = config.get("mode", "raw").strip().lower()
+
+    def _cfg(key, default=None):
+        if isinstance(config, dict):
+            return config.get(key, default)
+        return getattr(config, key, default)
+
+    fs             = float(_cfg("EEG_FS",                 256.0))
+    win_sec        = float(_cfg("EEG_WINDOW_SEC",         4.0))
+    overlap        = float(_cfg("EEG_OVERLAP",            0.5))
+    use_baseline   = bool( _cfg("USE_BASELINE_REDUCTION", False))
+    superclass_map = _cfg("SUPERCLASS_MAP", {})
+    mode           = str(  _cfg("MODE", "cleaned")).lower()
+
+    win_samples  = int(win_sec * fs)
+    step_samples = max(1, int(win_samples * (1.0 - overlap)))
+
+    print("\n" + "=" * 70)
+    print("  LOADING EEG DATA  (MUSE)")
+    print("=" * 70)
+    print(f"  Root            : {data_root}")
+    print(f"  Mode            : {mode}")
+    print(f"  Fs              : {fs} Hz")
+    print(f"  Window          : {win_sec}s  ({win_samples} samples)")
+    print(f"  Overlap         : {overlap}")
+    print(f"  Baseline reduc. : {use_baseline}")
+
+    # ------------------------------------------------------------------
+    # Discover files — raw or cleaned
+    # ------------------------------------------------------------------
     if mode == "raw":
-        return _load_raw(data_root, config)
-    elif mode == "cleaned":
-        return _load_cleaned(data_root, config)
-    else:
-        raise ValueError(f"Unknown mode '{mode}'. Choose 'raw' or 'cleaned'.")
+        patterns = [
+            os.path.join(data_root, "*_STIMULUS_MUSE.json"),
+            os.path.join(data_root, "*", "*_STIMULUS_MUSE.json"),
+        ]
+    else:  # cleaned
+        patterns = [
+            os.path.join(data_root, "*_STIMULUS_MUSE_cleaned.json"),
+            os.path.join(data_root, "*", "*_STIMULUS_MUSE_cleaned.json"),
+            os.path.join(data_root, "*", "*_STIMULUS_MUSE_cleaned",
+                         "*_STIMULUS_MUSE_cleaned.json"),
+        ]
+
+    files = sorted({p for pat in patterns for p in glob.glob(pat)})
+
+    # Exclude baseline files from the main file list
+    files = [f for f in files if "BASELINE" not in os.path.basename(f).upper()]
+
+    print(f"\n  Found {len(files)} MUSE {mode} file(s).")
+
+    if not files:
+        raise FileNotFoundError(
+            f"No MUSE {mode} files found under '{data_root}'.\n"
+            f"  Raw    pattern : *_STIMULUS_MUSE.json\n"
+            f"  Cleaned pattern: *_STIMULUS_MUSE_cleaned.json\n"
+            f"Run check_json_structure('{data_root}') to inspect the layout."
+        )
+
+    # ------------------------------------------------------------------
+    # Load baseline recordings (optional)
+    # ------------------------------------------------------------------
+    baseline_dict = {}
+    if use_baseline:
+        baseline_dict = _load_baseline_files(files, data_root)
+
+    # ------------------------------------------------------------------
+    # Process each file
+    # ------------------------------------------------------------------
+    all_windows, all_labels, all_subjects, all_trials = [], [], [], []
+    skipped       = Counter()
+    reduced_count = 0
+
+    for fpath in files:
+        fname = os.path.basename(fpath)
+        parts = fname.split("_")
+
+        if len(parts) < 2:
+            skipped["parse_error"] += 1
+            continue
+
+        subject = parts[0]
+        emotion = parts[1].upper()
+
+        if emotion not in superclass_map:
+            skipped["unknown_emotion"] += 1
+            continue
+
+        superclass = superclass_map[emotion]
+        trial_id   = f"{subject}_{emotion}"
+
+        try:
+            with open(fpath, "r") as fh:
+                data = json.load(fh)
+
+            # Extract & interpolate channels
+            channels = [_interp_nan(_to_num(data.get(c, []))) for c in EEG_COLS]
+            L = min(len(ch) for ch in channels)
+            if L == 0:
+                skipped["no_data"] += 1
+                continue
+
+            # Quality mask (applied to both raw and cleaned)
+            hsi_arrays = [_to_num(data.get(h, []))[:L] for h in HSI_COLS]
+            head_on    = _to_num(data.get("HeadBandOn", []))[:L]
+
+            mask = np.ones(L, dtype=bool)
+            if len(head_on) == L:
+                mask &= (head_on == 1)
+            for hsi in hsi_arrays:
+                if len(hsi) == L:
+                    mask &= np.isfinite(hsi) & (hsi <= 2)
+            for ch in channels:
+                mask &= np.isfinite(ch[:L])
+
+            channels = [ch[:L][mask] for ch in channels]
+            L = len(channels[0])
+            if L < win_samples:
+                skipped["insufficient_length"] += 1
+                continue
+
+            # Stack → (T, 4), zero-mean per channel
+            signal = np.stack(channels, axis=1).astype(np.float32)
+            signal -= np.nanmean(signal, axis=0, keepdims=True)
+
+            # Baseline reduction
+            if use_baseline and subject in baseline_dict:
+                baseline_sig = baseline_dict[subject]
+                common       = min(len(signal), len(baseline_sig))
+                signal       = apply_baseline_reduction(
+                    signal[:common], baseline_sig[:common]
+                )
+                L            = len(signal)
+                reduced_count += 1
+
+            # Windowing
+            n_before = len(all_windows)
+            for start in range(0, L - win_samples + 1, step_samples):
+                all_windows.append(signal[start : start + win_samples])
+                all_labels.append(superclass)
+                all_subjects.append(subject)
+                all_trials.append(trial_id)
+
+            if len(all_windows) == n_before:
+                skipped["insufficient_length"] += 1
+
+        except Exception as exc:
+            skipped["parse_error"] += 1
+            print(f"  [warning] {fname}: {exc}")
+            continue
+
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+    print(f"\n  Windows extracted : {len(all_windows)}")
+    if skipped:
+        print(f"  Skipped           : {dict(skipped)}")
+    if use_baseline:
+        print(f"  Baseline applied  : {reduced_count} file(s)")
+
+    if not all_windows:
+        raise ValueError("No valid EEG windows could be extracted.")
+
+    # ------------------------------------------------------------------
+    # Assemble outputs
+    # ------------------------------------------------------------------
+    X_raw         = np.stack(all_windows).astype(np.float32)   # (N, W, 4)
+    unique_labels = sorted(set(all_labels))
+    label_to_id   = {lab: i for i, lab in enumerate(unique_labels)}
+    y_labels      = np.array([label_to_id[l] for l in all_labels], dtype=np.int64)
+    subject_ids   = np.array(all_subjects)
+    trial_ids     = np.array(all_trials)
+
+    print(f"\n  X shape           : {X_raw.shape}")
+    print(f"  Label distribution: {Counter(all_labels)}")
+    print(f"  label_to_id       : {label_to_id}")
+    print("=" * 70 + "\n")
+
+    return X_raw, y_labels, subject_ids, trial_ids, label_to_id
 
 
 # ===========================================================================
@@ -603,88 +398,104 @@ def load_eeg_data(
 def create_data_splits(
     y_labels:    np.ndarray,
     subject_ids: np.ndarray,
-    config:      dict,
+    config,
     trial_ids:   Optional[np.ndarray] = None,
     train_ratio: float = 0.70,
     val_ratio:   float = 0.15,
     test_ratio:  float = 0.15,
 ) -> Dict[str, np.ndarray]:
     """
-    Create train / val / test boolean index splits.
+    Create train / val / test index arrays.
 
     Parameters
     ----------
     y_labels    : (N,) label array.
     subject_ids : (N,) subject identifier array.
-    config      : Config dict.  Key option:
+    config      : Config object or dict.  Key options:
 
-        split_strategy (str)
-            'subject_independent' — whole subjects in one split only.
-            'clip_independent'    — whole trials in one split only.
-            'random'              — shuffled randomly (default).
+        SUBJECT_INDEPENDENT (bool) — whole subjects in one split only.
+        CLIP_INDEPENDENT    (bool) — whole trials in one split only.
+        (default)                  — random shuffle.
 
-    trial_ids   : (N,) trial identifiers (required for clip_independent).
+    trial_ids   : (N,) trial IDs (required for CLIP_INDEPENDENT).
     train_ratio : Fraction for training.
     val_ratio   : Fraction for validation.
     test_ratio  : Fraction for test.
 
     Returns
     -------
-    Dict with keys 'train', 'val', 'test' — each a bool array of shape (N,).
+    Dict with keys 'train', 'val', 'test' — each an integer index array.
     """
-    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, \
-        "train_ratio + val_ratio + test_ratio must equal 1.0"
+    def _cfg(key, default=None):
+        if isinstance(config, dict):
+            return config.get(key, default)
+        return getattr(config, key, default)
 
-    strategy  = config.get("split_strategy", "random").strip().lower()
-    rng       = np.random.default_rng(config.get("seed", 42))
-    N         = len(y_labels)
-    train_idx = np.zeros(N, dtype=bool)
-    val_idx   = np.zeros(N, dtype=bool)
-    test_idx  = np.zeros(N, dtype=bool)
+    subject_independent = bool(_cfg("SUBJECT_INDEPENDENT", False))
+    clip_independent    = bool(_cfg("CLIP_INDEPENDENT",    False))
+    seed                = int( _cfg("SEED", _cfg("seed", 42)))
 
-    if strategy == "subject_independent":
+    rng = np.random.default_rng(seed)
+    N   = len(y_labels)
+
+    print("\n" + "=" * 70)
+    print("  CREATING DATA SPLITS")
+    print("=" * 70)
+
+    if subject_independent:
+        print("  Strategy : SUBJECT-INDEPENDENT")
         subjects = np.unique(subject_ids)
         rng.shuffle(subjects)
-        n_train    = max(1, int(len(subjects) * train_ratio))
-        n_val      = max(1, int(len(subjects) * val_ratio))
-        train_subs = set(subjects[:n_train])
-        val_subs   = set(subjects[n_train : n_train + n_val])
-        test_subs  = set(subjects[n_train + n_val :])
-        train_idx  = np.isin(subject_ids, list(train_subs))
-        val_idx    = np.isin(subject_ids, list(val_subs))
-        test_idx   = np.isin(subject_ids, list(test_subs))
-        print(f"[split] subject_independent — "
-              f"train subs={len(train_subs)}  val subs={len(val_subs)}  "
-              f"test subs={len(test_subs)}")
+        n_test  = max(1, int(len(subjects) * test_ratio))
+        n_val   = max(1, int(len(subjects) * val_ratio))
+        test_s  = subjects[:n_test]
+        val_s   = subjects[n_test : n_test + n_val]
+        train_s = subjects[n_test + n_val :]
+        train_mask = np.isin(subject_ids, train_s)
+        val_mask   = np.isin(subject_ids, val_s)
+        test_mask  = np.isin(subject_ids, test_s)
+        print(f"  Train subjects : {len(train_s)}  "
+              f"Val : {len(val_s)}  Test : {len(test_s)}")
 
-    elif strategy == "clip_independent":
-        if trial_ids is None:
-            raise ValueError(
-                "'clip_independent' strategy requires trial_ids to be provided."
-            )
-        trials       = np.unique(trial_ids)
+    elif clip_independent and trial_ids is not None:
+        print("  Strategy : CLIP-INDEPENDENT")
+        trials = np.unique(trial_ids)
         rng.shuffle(trials)
-        n_train      = max(1, int(len(trials) * train_ratio))
-        n_val        = max(1, int(len(trials) * val_ratio))
-        train_trials = set(trials[:n_train])
-        val_trials   = set(trials[n_train : n_train + n_val])
-        test_trials  = set(trials[n_train + n_val :])
-        train_idx    = np.isin(trial_ids, list(train_trials))
-        val_idx      = np.isin(trial_ids, list(val_trials))
-        test_idx     = np.isin(trial_ids, list(test_trials))
-        print(f"[split] clip_independent — "
-              f"train clips={len(train_trials)}  val clips={len(val_trials)}  "
-              f"test clips={len(test_trials)}")
+        n_test   = max(1, int(len(trials) * test_ratio))
+        n_val    = max(1, int(len(trials) * val_ratio))
+        test_t   = trials[:n_test]
+        val_t    = trials[n_test : n_test + n_val]
+        train_t  = trials[n_test + n_val :]
+        train_mask = np.isin(trial_ids, train_t)
+        val_mask   = np.isin(trial_ids, val_t)
+        test_mask  = np.isin(trial_ids, test_t)
+        print(f"  Train trials : {len(train_t)}  "
+              f"Val : {len(val_t)}  Test : {len(test_t)}")
 
-    else:  # random
+    else:
+        print("  Strategy : RANDOM")
         indices = np.arange(N)
         rng.shuffle(indices)
-        n_train = int(N * train_ratio)
+        n_test  = int(N * test_ratio)
         n_val   = int(N * val_ratio)
-        train_idx[indices[:n_train]]               = True
-        val_idx  [indices[n_train:n_train + n_val]] = True
-        test_idx [indices[n_train + n_val:]]        = True
-        print(f"[split] random — train={train_idx.sum()}  "
-              f"val={val_idx.sum()}  test={test_idx.sum()}")
+        train_mask = np.zeros(N, dtype=bool)
+        val_mask   = np.zeros(N, dtype=bool)
+        test_mask  = np.zeros(N, dtype=bool)
+        test_mask [indices[:n_test]]               = True
+        val_mask  [indices[n_test : n_test + n_val]] = True
+        train_mask[indices[n_test + n_val :]]       = True
 
-    return {"train": train_idx, "val": val_idx, "test": test_idx}
+    split_indices = {
+        "train": np.where(train_mask)[0],
+        "val":   np.where(val_mask)[0],
+        "test":  np.where(test_mask)[0],
+    }
+
+    print(f"\n  Train samples : {len(split_indices['train'])}")
+    print(f"  Val   samples : {len(split_indices['val'])}")
+    print(f"  Test  samples : {len(split_indices['test'])})")
+    for split, idx in split_indices.items():
+        print(f"  {split:5s} class dist : {dict(Counter(y_labels[idx].tolist()))}")
+    print("=" * 70 + "\n")
+
+    return split_indices

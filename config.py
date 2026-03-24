@@ -353,3 +353,43 @@ LOADER_CFG: dict = {
     "split_strategy":   CFG["training"]["split_strategy"],
     "seed":             CFG["reproducibility"]["seed"],
 }
+
+# ---------------------------------------------------------------------------
+# Simple config object — used by data_loader.py and test_pipeline.py
+# ---------------------------------------------------------------------------
+
+class _Config:
+    """Attribute-style config wrapper consumed by data_loader.py."""
+
+    # Sampling & windowing
+    EEG_FS          = 256.0   # MUSE sampling rate (Hz)
+    EEG_WINDOW_SEC  = 4.0     # Window length (seconds)
+    EEG_OVERLAP     = 0.5     # Overlap fraction  [0, 1)
+
+    # Mode: 'raw' for *_STIMULUS_MUSE.json, 'cleaned' for *_STIMULUS_MUSE_cleaned.json
+    MODE = "cleaned"
+
+    # Baseline reduction
+    USE_BASELINE_REDUCTION = False   # Set True to enable InvBase
+
+    # Split strategy — pick ONE
+    SUBJECT_INDEPENDENT = True
+    CLIP_INDEPENDENT    = False
+
+    # Reproducibility
+    SEED = 42
+
+    # Emotion → superclass mapping
+    # Keys must match the second "_"-delimited part of each filename (upper-cased)
+    SUPERCLASS_MAP = {
+        "ANGER":     "anger",
+        "DISGUST":   "disgust",
+        "FEAR":      "fear",
+        "HAPPINESS": "happiness",
+        "NEUTRAL":   "neutral",
+        "SADNESS":   "sadness",
+        "SURPRISE":  "surprise",
+    }
+
+
+CONFIG = _Config()
