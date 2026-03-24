@@ -8,20 +8,23 @@ Loads real EEG data then tests all three feature modes:
 
 Usage
 -----
-    # Test statistical mode only (no PyTorch needed)
+    # Test with cleaned files (default)
     python test_feature_extractor.py --data "path/to/dataset" --mode cleaned
 
+    # Test with raw files
+    python test_feature_extractor.py --data "path/to/dataset" --mode raw
+
     # Test a specific deep extractor
-    python test_feature_extractor.py --data "path/to/dataset" --extractor cnn1d
-    python test_feature_extractor.py --data "path/to/dataset" --extractor lstm
-    python test_feature_extractor.py --data "path/to/dataset" --extractor cnn_lstm
-    python test_feature_extractor.py --data "path/to/dataset" --extractor transformer
+    python test_feature_extractor.py --data "path/to/dataset" --mode raw --feature_mode deep --extractor cnn1d
+    python test_feature_extractor.py --data "path/to/dataset" --mode raw --feature_mode deep --extractor lstm
+    python test_feature_extractor.py --data "path/to/dataset" --mode raw --feature_mode deep --extractor cnn_lstm
+    python test_feature_extractor.py --data "path/to/dataset" --mode raw --feature_mode deep --extractor transformer
 
     # Test combined mode
-    python test_feature_extractor.py --data "path/to/dataset" --feature_mode combined --extractor cnn1d
+    python test_feature_extractor.py --data "path/to/dataset" --mode raw --feature_mode combined --extractor cnn1d
 
     # Test all deep extractors in one run
-    python test_feature_extractor.py --data "path/to/dataset" --test_all_deep
+    python test_feature_extractor.py --data "path/to/dataset" --mode raw --test_all_deep
 """
 
 from __future__ import annotations
@@ -222,7 +225,8 @@ def main():
     )
     parser.add_argument("--data",         metavar="PATH", required=True)
     parser.add_argument("--mode",         default="cleaned", choices=["raw", "cleaned"],
-                        help="Dataset file mode.")
+                        help="Dataset file mode: 'raw' for *_STIMULUS_MUSE.json, "
+                             "'cleaned' for *_STIMULUS_MUSE_cleaned.json")
     parser.add_argument("--feature_mode", default="statistical",
                         choices=["statistical", "deep", "combined"],
                         help="Feature extraction mode to test.")
@@ -238,13 +242,28 @@ def main():
     CONFIG.MODE = args.mode
 
     # ----------------------------------------------------------------
+    # Print run configuration upfront
+    # ----------------------------------------------------------------
+    _section("Run Configuration")
+    print(f"  Dataset path   : {args.data}")
+    print(f"  Dataset mode   : {args.mode}  "
+          f"({'*_STIMULUS_MUSE.json' if args.mode == 'raw' else '*_STIMULUS_MUSE_cleaned.json'})")
+    print(f"  Feature mode   : {args.feature_mode}")
+    print(f"  Deep extractor : {args.extractor}")
+    print(f"  Embed dim      : {args.embed_dim}")
+    print(f"  Test all deep  : {args.test_all_deep}")
+    print(f"  PyTorch        : {'available' if _TORCH_AVAILABLE else 'NOT installed'}")
+
+    # ----------------------------------------------------------------
     # Load data once — shared across all tests
     # ----------------------------------------------------------------
     _section("Step 1 : Loading EEG Windows")
     X_raw, y, subject_ids, trial_ids, label_to_id = load_eeg_data(args.data, CONFIG)
     N, W, C = X_raw.shape
-    print(f"  X_raw shape : {X_raw.shape}")
-    print(f"  Labels      : {label_to_id}")
+    print(f"  X_raw shape    : {X_raw.shape}")
+    print(f"  Labels         : {label_to_id}")
+    print(f"  Subjects       : {sorted(set(subject_ids.tolist()))}")
+    print(f"  Unique trials  : {len(np.unique(trial_ids))}")
 
     all_results = []
 
@@ -259,7 +278,6 @@ def main():
     if args.test_all_deep:
         for ext in ["cnn1d", "lstm", "cnn_lstm", "transformer"]:
             test_deep(X_raw, ext, args.embed_dim, all_results)
-        # Combined with the first extractor as a representative check
         test_combined(X_raw, "cnn1d", args.embed_dim, all_results)
 
     elif args.feature_mode == "deep":
@@ -280,7 +298,9 @@ def main():
         icon = "✓" if result else "✗"
         print(f"  {icon}  {desc}")
 
-    print(f"\n  {passed} passed  |  {failed} failed  |  {len(all_results)} total")
+    print(f"\n  Dataset mode    : {args.mode}")
+    print(f"  Feature mode    : {args.feature_mode}")
+    print(f"  {passed} passed  |  {failed} failed  |  {len(all_results)} total")
     print(f"  PyTorch available : {_TORCH_AVAILABLE}")
     print("=" * 70 + "\n")
 
