@@ -245,6 +245,8 @@ def load_eeg_data(
         patterns = [
             os.path.join(data_root, "*_STIMULUS_MUSE.json"),
             os.path.join(data_root, "*", "*_STIMULUS_MUSE.json"),
+            os.path.join(data_root, "*", "*_STIMULUS_MUSE",
+                         "*_STIMULUS_MUSE.json"),
         ]
     else:  # cleaned
         patterns = [
