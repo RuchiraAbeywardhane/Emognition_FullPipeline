@@ -391,5 +391,28 @@ class _Config:
         "SURPRISE":  "surprise",
     }
 
+    # ------------------------------------------------------------------
+    # Feature extraction
+    # ------------------------------------------------------------------
+    # 'statistical' — hand-crafted features only         → (N, C×26)
+    # 'deep'        — learned embedding only             → (N, DEEP_EMBED_DIM)
+    # 'combined'    — statistical + deep concatenated    → (N, C×26 + DEEP_EMBED_DIM)
+    FEATURE_MODE    = "statistical"
+
+    # Deep extractor model: 'cnn1d' | 'lstm' | 'cnn_lstm' | 'transformer'
+    DEEP_EXTRACTOR  = "cnn1d"
+
+    # Output embedding size for deep extractors
+    DEEP_EMBED_DIM  = 128
+
+    # Batch size used when running deep extractors
+    DEEP_BATCH_SIZE = 256
+
+    # Device for PyTorch inference: 'cpu' or 'cuda'
+    DEVICE          = "cpu"
+
+    # Numerical stability constant
+    EPS             = 1e-12
+
 
 CONFIG = _Config()
