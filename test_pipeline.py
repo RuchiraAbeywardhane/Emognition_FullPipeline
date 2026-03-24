@@ -752,3 +752,7 @@ def _run_real_data_tests(data_root: str, mode: str) -> None:
     test_real_load()
     test_real_labels()
     test_real_baselines()
+
+
+if __name__ == "__main__":
+    main()
