@@ -300,7 +300,7 @@ def _load_single_json(filepath: str, config: dict) -> Optional[pd.DataFrame]:
     ---------------------
     1. A dict with a 'data' key whose value is a list of sample dicts.
     2. A plain list of sample dicts.
-    3. A dict whose values are lists of equal length (column-oriented).
+    3. A dict whose values are lists (column-oriented) — equal or unequal lengths.
     """
     with open(filepath, "r") as fh:
         raw = json.load(fh)
@@ -310,7 +310,16 @@ def _load_single_json(filepath: str, config: dict) -> Optional[pd.DataFrame]:
     elif isinstance(raw, list):
         df = pd.DataFrame(raw)
     elif isinstance(raw, dict):
-        df = pd.DataFrame(raw)
+        # Column-oriented: truncate all columns to the shortest list length
+        # to handle unequal length arrays gracefully
+        col_lengths = {k: len(v) for k, v in raw.items() if isinstance(v, list)}
+        if col_lengths:
+            min_len = min(col_lengths.values())
+            truncated = {k: (v[:min_len] if isinstance(v, list) else v)
+                         for k, v in raw.items()}
+            df = pd.DataFrame(truncated)
+        else:
+            df = pd.DataFrame([raw])  # scalar values — wrap as single row
     else:
         print(f"  [warning] Unrecognised JSON format in '{filepath}' — skipping.")
         return None
