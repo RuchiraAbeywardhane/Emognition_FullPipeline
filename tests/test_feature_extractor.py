@@ -36,13 +36,14 @@ import time
 
 import numpy as np
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+# Add project root to path so 'config' and 'pipeline' are importable
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
-from config import CONFIG
-from data_loader import load_eeg_data
-from eeg_feature_extractor import (
+from config.config import CONFIG
+from data_loaders.data_loader import load_eeg_data
+from feature_extraction.feature_extractor import (
     extract_eeg_features,
     get_feature_names,
     BANDS,

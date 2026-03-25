@@ -24,7 +24,7 @@ import pandas as pd
 # Optional external feature extractor
 # ---------------------------------------------------------------------------
 try:
-    from eeg_feature_extractor import extract_eeg_features
+    from pipeline.feature_extraction.feature_extractor import extract_eeg_features
     _HAS_EXTRACTOR = True
 except ImportError:
     _HAS_EXTRACTOR = False
