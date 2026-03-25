@@ -23,6 +23,7 @@ class RandomForestModel(BaseModel):
     n_estimators : int   number of trees          [200]
     max_depth    : int   max tree depth           [None]
     n_jobs       : int   parallel jobs (-1=all)   [-1]
+    class_weight : str   'balanced' | None        ['balanced']
     """
 
     def __init__(self, num_classes: int, config=None):
@@ -35,19 +36,25 @@ class RandomForestModel(BaseModel):
         self.n_estimators = arch.get("n_estimators", 200)
         self.max_depth    = arch.get("max_depth",    None)
         self.n_jobs       = arch.get("n_jobs",       -1)
+        self.class_weight = arch.get("class_weight", "balanced")
 
         self.model = RandomForestClassifier(
             n_estimators=self.n_estimators,
             max_depth=self.max_depth,
             n_jobs=self.n_jobs,
+            class_weight=self.class_weight,
             random_state=42,
         )
 
     def fit(self, X_train: np.ndarray, y_train: np.ndarray,
             X_val: Optional[np.ndarray] = None,
             y_val: Optional[np.ndarray] = None) -> "RandomForestModel":
+        from collections import Counter
+        dist = Counter(y_train.tolist())
         print(f"  [RandomForest] Fitting on {X_train.shape[0]} samples, "
               f"{X_train.shape[1]} features …")
+        print(f"  [RandomForest] Class distribution : {dict(dist)}  "
+              f"(class_weight={self.class_weight})")
         self.model.fit(X_train, y_train)
         self.is_fitted = True
 
@@ -67,4 +74,5 @@ class RandomForestModel(BaseModel):
         return self.model.predict_proba(X)
 
     def get_params(self) -> dict:
-        return {"n_estimators": self.n_estimators, "max_depth": self.max_depth}
+        return {"n_estimators": self.n_estimators, "max_depth": self.max_depth,
+                "class_weight": self.class_weight}

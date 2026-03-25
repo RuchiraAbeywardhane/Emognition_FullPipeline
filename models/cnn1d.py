@@ -24,6 +24,15 @@ except ImportError:
 from models.base_model import BaseModel
 
 
+def _compute_class_weights(y: np.ndarray, num_classes: int) -> "torch.Tensor":
+    """Compute inverse-frequency class weights and return as a CPU tensor."""
+    counts = np.bincount(y, minlength=num_classes).astype(np.float64)
+    counts = np.where(counts == 0, 1, counts)
+    weights = 1.0 / counts
+    weights = weights / weights.sum() * num_classes
+    return torch.tensor(weights, dtype=torch.float32)
+
+
 # ===========================================================================
 # PyTorch Module
 # ===========================================================================
@@ -132,19 +141,26 @@ class CNN1DModel(BaseModel):
             X_val: Optional[np.ndarray] = None,
             y_val: Optional[np.ndarray] = None) -> "CNN1DModel":
 
+        from collections import Counter
+        dist = Counter(y_train.tolist())
+
         N, W, C = X_train.shape
         self._build(C, W)
         optimizer = torch.optim.Adam(self.net_.parameters(),
                                      lr=self.lr, weight_decay=self.weight_decay)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, patience=5, factor=0.5, min_lr=1e-6)
-        criterion = nn.CrossEntropyLoss()
 
-        train_loader = self._make_loader(X_train, y_train, shuffle=True)
+        class_weights = _compute_class_weights(y_train, self.num_classes).to(self.device)
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+        train_loader  = self._make_loader(X_train, y_train, shuffle=True)
         best_val_loss = float("inf")
         no_improve    = 0
 
         print(f"  [CNN1D] Training on {N} samples | device={self.device} | epochs={self.epochs}")
+        print(f"  [CNN1D] Class distribution : {dict(dist)}")
+        print(f"  [CNN1D] Class weights      : {class_weights.tolist()}")
 
         for epoch in range(1, self.epochs + 1):
             self.net_.train()

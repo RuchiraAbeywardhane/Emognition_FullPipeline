@@ -60,6 +60,15 @@ class _MLPNet(nn.Module):
 # BaseModel wrapper
 # ===========================================================================
 
+def _compute_class_weights(y: np.ndarray, num_classes: int) -> "torch.Tensor":
+    """Compute inverse-frequency class weights and return as a CPU tensor."""
+    counts = np.bincount(y, minlength=num_classes).astype(np.float64)
+    counts = np.where(counts == 0, 1, counts)          # avoid /0
+    weights = 1.0 / counts
+    weights = weights / weights.sum() * num_classes    # normalise
+    return torch.tensor(weights, dtype=torch.float32)
+
+
 class MLPModel(BaseModel):
     """
     MLP classifier with early stopping.
@@ -124,12 +133,17 @@ class MLPModel(BaseModel):
             X_val: Optional[np.ndarray] = None,
             y_val: Optional[np.ndarray] = None) -> "MLPModel":
 
+        from collections import Counter
+        dist = Counter(y_train.tolist())
+
         self._build(X_train.shape[1])
         optimizer = torch.optim.Adam(self.net_.parameters(),
                                      lr=self.lr, weight_decay=self.weight_decay)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, patience=5, factor=0.5, min_lr=1e-6)
-        criterion = nn.CrossEntropyLoss()
+
+        class_weights = _compute_class_weights(y_train, self.num_classes).to(self.device)
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
 
         train_loader = self._make_loader(X_train, y_train, shuffle=True)
         best_val_loss = float("inf")
@@ -137,6 +151,8 @@ class MLPModel(BaseModel):
 
         print(f"  [MLP] Training on {X_train.shape[0]} samples | "
               f"device={self.device} | epochs={self.epochs}")
+        print(f"  [MLP] Class distribution : {dict(dist)}")
+        print(f"  [MLP] Class weights      : {class_weights.tolist()}")
 
         for epoch in range(1, self.epochs + 1):
             # --- train ---

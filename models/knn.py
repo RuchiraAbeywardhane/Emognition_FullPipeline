@@ -45,8 +45,11 @@ class KNNModel(BaseModel):
     def fit(self, X_train: np.ndarray, y_train: np.ndarray,
             X_val: Optional[np.ndarray] = None,
             y_val: Optional[np.ndarray] = None) -> "KNNModel":
+        from collections import Counter
+        dist = Counter(y_train.tolist())
         print(f"  [KNN] Fitting on {X_train.shape[0]} samples, "
               f"{X_train.shape[1]} features …")
+        print(f"  [KNN] Class distribution : {dict(dist)}")
         X_scaled = self.scaler.fit_transform(X_train)
         self.model.fit(X_scaled, y_train)
         self.is_fitted = True

@@ -27,8 +27,11 @@ class LDAModel(BaseModel):
     def fit(self, X_train: np.ndarray, y_train: np.ndarray,
             X_val: Optional[np.ndarray] = None,
             y_val: Optional[np.ndarray] = None) -> "LDAModel":
+        from collections import Counter
+        dist = Counter(y_train.tolist())
         print(f"  [LDA] Fitting on {X_train.shape[0]} samples, "
               f"{X_train.shape[1]} features …")
+        print(f"  [LDA] Class distribution : {dict(dist)}")
         self.model.fit(X_train, y_train)
         self.is_fitted = True
 

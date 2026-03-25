@@ -34,6 +34,7 @@ class SVMModel(BaseModel):
     C           : float regularisation strength      [1.0]
     gamma       : str   'scale' | 'auto' | float     [scale]
     probability : bool  enable predict_proba         [True]
+    class_weight: str   'balanced' | None            ['balanced']
     """
 
     def __init__(self, num_classes: int, config=None):
@@ -43,10 +44,11 @@ class SVMModel(BaseModel):
         if isinstance(config, dict):
             arch = config.get("models", {}).get("architectures", {}).get("svm", {})
 
-        self.kernel      = arch.get("kernel",      "rbf")
-        self.C           = arch.get("C",           1.0)
-        self.gamma       = arch.get("gamma",       "scale")
-        self.probability = arch.get("probability", True)
+        self.kernel       = arch.get("kernel",       "rbf")
+        self.C            = arch.get("C",            1.0)
+        self.gamma        = arch.get("gamma",        "scale")
+        self.probability  = arch.get("probability",  True)
+        self.class_weight = arch.get("class_weight", "balanced")
 
         self.scaler = StandardScaler()
         self.model  = SVC(
@@ -54,6 +56,7 @@ class SVMModel(BaseModel):
             C=self.C,
             gamma=self.gamma,
             probability=self.probability,
+            class_weight=self.class_weight,
             random_state=42,
         )
 
@@ -62,8 +65,12 @@ class SVMModel(BaseModel):
     def fit(self, X_train: np.ndarray, y_train: np.ndarray,
             X_val: Optional[np.ndarray] = None,
             y_val: Optional[np.ndarray] = None) -> "SVMModel":
+        from collections import Counter
+        dist = Counter(y_train.tolist())
         print(f"  [SVM] Fitting on {X_train.shape[0]} samples, "
               f"{X_train.shape[1]} features …")
+        print(f"  [SVM] Class distribution : {dict(dist)}  "
+              f"(class_weight={self.class_weight})")
         X_scaled = self.scaler.fit_transform(X_train)
         self.model.fit(X_scaled, y_train)
         self.is_fitted = True
@@ -84,4 +91,5 @@ class SVMModel(BaseModel):
         return self.model.predict_proba(self.scaler.transform(X))
 
     def get_params(self) -> dict:
-        return {"kernel": self.kernel, "C": self.C, "gamma": self.gamma}
+        return {"kernel": self.kernel, "C": self.C, "gamma": self.gamma,
+                "class_weight": self.class_weight}
