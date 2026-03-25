@@ -1,9 +1,7 @@
 """
 test_models.py — Model Test Script
 ============================================================
-Tests every registered model using synthetic EEG-shaped data so
-no dataset path is required for a quick smoke-test.  Optionally
-loads real data with --data for a full integration test.
+Tests every registered model using the real Emognition dataset.
 
 What is tested per model
 ------------------------
@@ -17,20 +15,17 @@ What is tested per model
 
 Usage
 -----
-  # Quick smoke-test with synthetic data (no dataset needed)
-  python tests/test_models.py
-
-  # Select specific models
-  python tests/test_models.py --models svm random_forest cnn1d
-
-  # Deep models only
-  python tests/test_models.py --models mlp cnn1d lstm bilstm cnn_lstm transformer
-
-  # Full integration test with real data
+  # Test all models
   python tests/test_models.py --data "path/to/dataset"
 
-  # Real data + specific models
-  python tests/test_models.py --data "path/to/dataset" --models svm transformer
+  # Select specific models
+  python tests/test_models.py --data "path/to/dataset" --models svm random_forest cnn1d
+
+  # Deep models only
+  python tests/test_models.py --data "path/to/dataset" --models mlp cnn1d lstm bilstm cnn_lstm transformer
+
+  # Control training epochs for deep models
+  python tests/test_models.py --data "path/to/dataset" --epochs 10
 
 Author : Final Year Project
 Date   : 2026
@@ -52,24 +47,16 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from config.config import CFG
+from config.config import CFG, CONFIG
 from models import build_model, list_models, RAW_WINDOW_MODELS, FEATURE_MODELS
 from feature_extraction.feature_extractor import extract_eeg_features
+from data_loaders.data_loader import load_eeg_data, create_data_splits
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 PASS = "  [PASS]"
 FAIL = "  [FAIL]"
-SKIP = "  [SKIP]"
-
-NUM_CLASSES  = 4
-N_TRAIN      = 120
-N_VAL        = 30
-N_TEST       = 30
-WIN_LEN      = 256        # samples per window  (1 s at 256 Hz)
-N_CHANNELS   = 4
-N_FEATURES   = N_CHANNELS * 26   # statistical features → 104
 
 
 # ===========================================================================
@@ -88,38 +75,19 @@ def _section(title: str) -> None:
     print(f"{'=' * 70}")
 
 
-def _make_synthetic(n: int, kind: str) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Generate synthetic data.
-
-    kind = 'features' → (n, 104)  float32  feature vectors
-    kind = 'windows'  → (n, 256, 4) float32  raw EEG windows
-    """
-    rng = np.random.default_rng(42)
-    y   = rng.integers(0, NUM_CLASSES, size=n).astype(np.int64)
-    if kind == "features":
-        X = rng.standard_normal((n, N_FEATURES)).astype(np.float32)
-    else:
-        X = rng.standard_normal((n, WIN_LEN, N_CHANNELS)).astype(np.float32)
-    return X, y
-
-
 # ===========================================================================
 # SINGLE MODEL TEST
 # ===========================================================================
 
 def test_one_model(
-    name: str,
+    name:    str,
     X_train: np.ndarray, y_train: np.ndarray,
     X_val:   np.ndarray, y_val:   np.ndarray,
     X_test:  np.ndarray, y_test:  np.ndarray,
+    num_classes: int,
     results: list,
 ) -> dict:
-    """
-    Run the full test suite for one model.
-
-    Returns a result-summary dict for the final table.
-    """
+    """Run the full test suite for one model. Returns a summary dict."""
     _section(f"Model : {name.upper()}")
     model_results: list = []
     summary = {"name": name, "passed": 0, "failed": 0,
@@ -127,7 +95,7 @@ def test_one_model(
 
     # ---- 1. Instantiation -------------------------------------------------
     try:
-        model = build_model(name, num_classes=NUM_CLASSES, config=CFG)
+        model = build_model(name, num_classes=num_classes, config=CFG)
         _check("build_model() succeeds",    True,  model_results)
         _check("get_params() returns dict", isinstance(model.get_params(), dict), model_results)
         print(f"  Params : {model.get_params()}")
@@ -150,37 +118,37 @@ def test_one_model(
     except Exception as exc:
         _check(f"fit() raised: {exc}", False, model_results)
         summary.update({"passed": sum(r for _, r in model_results),
-                         "failed": sum(not r for _, r in model_results),
-                         "status": "FIT_FAIL"})
+                        "failed": sum(not r for _, r in model_results),
+                        "status": "FIT_FAIL"})
         results.extend(model_results)
         return summary
 
     # ---- 3. predict() -----------------------------------------------------
     try:
         preds = model.predict(X_test)
-        _check("predict() returns ndarray",            isinstance(preds, np.ndarray),        model_results)
-        _check("predict() shape == (N_TEST,)",         preds.shape == (N_TEST,),             model_results)
-        _check("predict() dtype is integer",           np.issubdtype(preds.dtype, np.integer), model_results)
-        _check("predict() values in [0, num_classes)", bool(np.all((preds >= 0) & (preds < NUM_CLASSES))), model_results)
-        _check("predict() no NaN",                    not np.isnan(preds.astype(float)).any(), model_results)
+        n_test = len(y_test)
+        _check("predict() returns ndarray",            isinstance(preds, np.ndarray),                       model_results)
+        _check("predict() shape == (N_test,)",         preds.shape == (n_test,),                            model_results)
+        _check("predict() dtype is integer",           np.issubdtype(preds.dtype, np.integer),              model_results)
+        _check("predict() values in [0, num_classes)", bool(np.all((preds >= 0) & (preds < num_classes))),  model_results)
+        _check("predict() no NaN",                     not np.isnan(preds.astype(float)).any(),             model_results)
 
         test_acc = float((preds == y_test).mean())
         summary["test_acc"] = test_acc
-        print(f"  Test accuracy : {test_acc:.4f}  "
-              f"(chance = {1/NUM_CLASSES:.4f})")
+        print(f"  Test accuracy : {test_acc:.4f}  (chance = {1/num_classes:.4f})")
     except Exception as exc:
         _check(f"predict() raised: {exc}", False, model_results)
 
     # ---- 4. predict_proba() -----------------------------------------------
     try:
-        proba = model.predict_proba(X_test)
-        _check("predict_proba() returns ndarray",            isinstance(proba, np.ndarray), model_results)
-        _check("predict_proba() shape == (N_TEST, classes)", proba.shape == (N_TEST, NUM_CLASSES), model_results)
-        _check("predict_proba() all values in [0, 1]",       bool(np.all((proba >= 0) & (proba <= 1))), model_results)
-        row_sums = proba.sum(axis=1)
-        _check("predict_proba() rows sum to 1 (±1e-4)",      bool(np.allclose(row_sums, 1.0, atol=1e-4)), model_results)
-        _check("predict_proba() no NaN",                     not np.isnan(proba).any(), model_results)
-        _check("predict_proba() no Inf",                     not np.isinf(proba).any(), model_results)
+        proba  = model.predict_proba(X_test)
+        n_test = len(y_test)
+        _check("predict_proba() returns ndarray",             isinstance(proba, np.ndarray),                      model_results)
+        _check("predict_proba() shape == (N_test, classes)",  proba.shape == (n_test, num_classes),               model_results)
+        _check("predict_proba() all values in [0, 1]",        bool(np.all((proba >= 0) & (proba <= 1))),          model_results)
+        _check("predict_proba() rows sum to 1 (±1e-4)",       bool(np.allclose(proba.sum(axis=1), 1.0, atol=1e-4)), model_results)
+        _check("predict_proba() no NaN",                      not np.isnan(proba).any(),                          model_results)
+        _check("predict_proba() no Inf",                      not np.isinf(proba).any(),                          model_results)
     except Exception as exc:
         _check(f"predict_proba() raised: {exc}", False, model_results)
 
@@ -199,32 +167,30 @@ def test_one_model(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Test all Emognition models.",
+        description="Test all Emognition models against the real dataset.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--data", metavar="PATH", default=None,
-        help="Optional path to real dataset root. "
-             "If omitted, synthetic data is used.",
+        "--data", metavar="PATH", required=True,
+        help="Path to the dataset root directory.",
     )
     parser.add_argument(
         "--mode", default="cleaned", choices=["raw", "cleaned"],
-        help="Dataset file mode (used only with --data).",
+        help="'cleaned' for *_STIMULUS_MUSE_cleaned.json, 'raw' for *_STIMULUS_MUSE.json",
     )
     parser.add_argument(
         "--models", nargs="+", default=None,
         metavar="MODEL",
-        help=f"Models to test. Defaults to all. "
-             f"Choices: {list_models()}",
+        help=f"Models to test. Defaults to all. Choices: {list_models()}",
     )
     parser.add_argument(
-        "--epochs", type=int, default=5,
-        help="Training epochs for deep models (keep small for fast testing).",
+        "--epochs", type=int, default=10,
+        help="Training epochs for deep models.",
     )
     args = parser.parse_args()
 
-    # Override epochs for faster testing
-    CFG["training"]["epochs"]  = args.epochs
+    # Apply epochs override
+    CFG["training"]["epochs"]   = args.epochs
     CFG["training"]["patience"] = max(3, args.epochs)
 
     models_to_test = args.models if args.models else list_models()
@@ -234,85 +200,73 @@ def main():
     bad   = [m for m in models_to_test if m not in valid]
     if bad:
         print(f"[ERROR] Unknown model(s): {bad}")
-        print(f"        Valid choices : {sorted(valid)}")
+        print(f"        Valid choices   : {sorted(valid)}")
         sys.exit(1)
 
     # -----------------------------------------------------------------------
     # Print run config
     # -----------------------------------------------------------------------
     _section("Run Configuration")
+    print(f"  Dataset path   : {args.data}")
+    print(f"  Dataset mode   : {args.mode}")
     print(f"  Models to test : {models_to_test}")
-    print(f"  Data source    : {'real — ' + args.data if args.data else 'synthetic'}")
     print(f"  Epochs (deep)  : {args.epochs}")
-    print(f"  NUM_CLASSES    : {NUM_CLASSES}")
 
     # -----------------------------------------------------------------------
-    # Build data splits
+    # Load real data
     # -----------------------------------------------------------------------
-    if args.data:
-        # --- Real data ---
-        _section("Loading Real EEG Data")
-        from config.config import CONFIG
-        from data_loaders.data_loader import load_eeg_data, create_data_splits
+    _section("Step 1 : Loading EEG Data")
+    CONFIG.MODE = args.mode
+    X_raw, y, subject_ids, trial_ids, label_to_id = load_eeg_data(args.data, CONFIG)
+    num_classes = len(label_to_id)
+    CFG["data"]["num_classes"] = num_classes
 
-        CONFIG.MODE = args.mode
-        X_raw, y, subject_ids, trial_ids, label_to_id = load_eeg_data(args.data, CONFIG)
-        num_classes = len(label_to_id)
-        CFG["data"]["num_classes"] = num_classes
+    print(f"  X_raw shape  : {X_raw.shape}")
+    print(f"  Classes      : {label_to_id}")
+    print(f"  Subjects     : {sorted(set(subject_ids.tolist()))}")
 
-        splits = create_data_splits(y, subject_ids, CONFIG, trial_ids=trial_ids)
-        tr, va, te = splits["train"], splits["val"], splits["test"]
+    # -----------------------------------------------------------------------
+    # Create splits
+    # -----------------------------------------------------------------------
+    _section("Step 2 : Creating Data Splits")
+    splits = create_data_splits(y, subject_ids, CONFIG, trial_ids=trial_ids)
+    tr, va, te = splits["train"], splits["val"], splits["test"]
+    print(f"  Train : {len(tr)}  Val : {len(va)}  Test : {len(te)}")
 
-        # Statistical features for classical / MLP models
-        CONFIG.FEATURE_MODE = "statistical"
-        X_feat = extract_eeg_features(X_raw, CONFIG)
+    # -----------------------------------------------------------------------
+    # Extract statistical features (for classical ML + MLP)
+    # -----------------------------------------------------------------------
+    _section("Step 3 : Extracting Statistical Features")
+    CONFIG.FEATURE_MODE = "statistical"
+    X_feat = extract_eeg_features(X_raw, CONFIG)
+    print(f"  Feature matrix : {X_feat.shape}")
 
-        X_feat_train, X_feat_val, X_feat_test = X_feat[tr], X_feat[va], X_feat[te]
-        X_raw_train,  X_raw_val,  X_raw_test  = X_raw[tr],  X_raw[va],  X_raw[te]
-        y_train, y_val, y_test                 = y[tr],      y[va],      y[te]
+    # Split both feature and raw-window arrays
+    X_feat_train, X_feat_val, X_feat_test = X_feat[tr], X_feat[va], X_feat[te]
+    X_raw_train,  X_raw_val,  X_raw_test  = X_raw[tr],  X_raw[va],  X_raw[te]
+    y_train,      y_val,      y_test       = y[tr],      y[va],      y[te]
 
-        print(f"  Feature splits : train={X_feat_train.shape}  "
-              f"val={X_feat_val.shape}  test={X_feat_test.shape}")
-        print(f"  Window  splits : train={X_raw_train.shape}  "
-              f"val={X_raw_val.shape}  test={X_raw_test.shape}")
-    else:
-        # --- Synthetic data ---
-        _section("Generating Synthetic Data")
-        num_classes = NUM_CLASSES
-
-        X_feat_train, y_train = _make_synthetic(N_TRAIN, "features")
-        X_feat_val,   y_val   = _make_synthetic(N_VAL,   "features")
-        X_feat_test,  y_test  = _make_synthetic(N_TEST,  "features")
-
-        X_raw_train, _ = _make_synthetic(N_TRAIN, "windows")
-        X_raw_val,   _ = _make_synthetic(N_VAL,   "windows")
-        X_raw_test,  _ = _make_synthetic(N_TEST,  "windows")
-
-        print(f"  Feature data : train={X_feat_train.shape}  "
-              f"val={X_feat_val.shape}  test={X_feat_test.shape}")
-        print(f"  Window  data : train={X_raw_train.shape}  "
-              f"val={X_raw_val.shape}  test={X_raw_test.shape}")
-        print(f"  Labels  : {np.unique(y_train).tolist()}  "
-              f"(random — accuracy ≈ {1/num_classes:.2f})")
+    print(f"  Feature splits : train={X_feat_train.shape}  val={X_feat_val.shape}  test={X_feat_test.shape}")
+    print(f"  Window  splits : train={X_raw_train.shape}   val={X_raw_val.shape}   test={X_raw_test.shape}")
 
     # -----------------------------------------------------------------------
     # Run tests
     # -----------------------------------------------------------------------
-    all_results: list  = []
+    all_results:   list = []
     all_summaries: list = []
 
     for name in models_to_test:
-        # Pick the right input format
-        if name in RAW_WINDOW_MODELS:
-            Xtr, Xva, Xte = X_raw_train, X_raw_val, X_raw_test
-        else:
-            Xtr, Xva, Xte = X_feat_train, X_feat_val, X_feat_test
-
+        Xtr, Xva, Xte = (
+            (X_raw_train,  X_raw_val,  X_raw_test)
+            if name in RAW_WINDOW_MODELS else
+            (X_feat_train, X_feat_val, X_feat_test)
+        )
         summary = test_one_model(
             name,
             Xtr, y_train,
             Xva, y_val,
             Xte, y_test,
+            num_classes,
             all_results,
         )
         all_summaries.append(summary)
@@ -323,11 +277,11 @@ def main():
     _section("FINAL SUMMARY")
 
     col = "{:<14}  {:>6}  {:>6}  {:>10}  {:>10}  {}"
-    print(col.format("Model", "Passed", "Failed", "Train(s)", "Test Acc", "Status"))
+    print("  " + col.format("Model", "Passed", "Failed", "Train(s)", "Test Acc", "Status"))
     print("  " + "-" * 66)
 
     for s in all_summaries:
-        acc = f"{s['test_acc']:.4f}" if s["test_acc"] is not None else "  n/a  "
+        acc = f"{s['test_acc']:.4f}" if s["test_acc"] is not None else "   n/a  "
         print("  " + col.format(
             s["name"],
             s["passed"],
@@ -341,8 +295,8 @@ def main():
     total_failed = sum(s["failed"] for s in all_summaries)
     total_checks = total_passed + total_failed
 
-    print(f"\n  Data source : {'real (' + args.data + ')' if args.data else 'synthetic'}")
-    print(f"  Epochs      : {args.epochs}")
+    print(f"\n  Dataset : {args.data}  ({args.mode})")
+    print(f"  Epochs  : {args.epochs}")
     print(f"\n  {total_passed} passed  |  {total_failed} failed  |  {total_checks} total checks")
     print("=" * 70 + "\n")
 
