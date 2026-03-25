@@ -136,6 +136,25 @@ CFG: dict = {
                     "p2p", "zcr", "energy", "mobility", "complexity",
                     "iqr", "max", "min", "median", "snr",
                 ],
+                # --- NEW: extra per-channel feature groups ---
+                # Wavelet DWT subband energies (requires PyWavelets)
+                "wavelet": {
+                    "enabled": True,
+                    "wavelet": "db4",
+                    "level":   5,        # number of decomposition levels
+                },
+                # Entropy features
+                "entropy": {
+                    "spectral_entropy":    True,   # Welch-based normalised SE
+                    "permutation_entropy": True,   # PE order=3, delay=1
+                },
+                # Per-channel alpha/beta, alpha/theta, theta/beta ratios
+                "band_ratios": True,
+                # --- NEW: cross-channel features ---
+                # Mean coherence per band for all 6 channel pairs → 30 features
+                "coherence": True,
+                # Frontal (AF7-AF8) and lateral (TP9-TP10) band-power asymmetry → 10
+                "asymmetry": True,
                 "eps": 1e-12,
             },
 
@@ -195,7 +214,19 @@ CFG: dict = {
                 "metric":      "euclidean",
             },
 
-            "lda": {},   # Linear Discriminant Analysis — no key hyperparams
+            # --- UPDATED LDA config ---
+            "lda": {
+                # 'lsqr' supports shrinkage; 'svd' does not
+                "solver":         "lsqr",
+                # Regularisation: 'auto' (Ledoit-Wolf), float 0-1, or None
+                "shrinkage":      "auto",
+                # Top-K features selected by mutual information before LDA.
+                # Set to None to keep all features.
+                "n_features_mi":  120,
+                # Grid-search shrinkage on the validation split when True
+                "tune_shrinkage": True,
+                "shrinkage_grid": [0.0, 0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9, "auto"],
+            },
 
             # ---- Deep Learning -------------------------------------------
             "mlp": {
@@ -285,6 +316,13 @@ CFG: dict = {
         # ---- Class imbalance ---------------------------------------------
         # 'none' | 'class_weight' | 'oversample' | 'smote'
         "imbalance_strategy": "class_weight",
+
+        # ---- Per-subject normalisation ------------------------------------
+        # When True, each subject's windows are z-scored independently
+        # before being passed to classical ML models. This matches the
+        # normalisation strategy used in the reference pipeline and reduces
+        # inter-subject amplitude variability.
+        "per_subject_norm": True,
     },
 
     # =======================================================================
@@ -407,6 +445,9 @@ class _Config:
 
     # Numerical stability constant
     EPS             = 1e-12
+
+    # Per-subject normalisation (used by data_loader / trainer)
+    PER_SUBJECT_NORM = True
 
 
 CONFIG = _Config()
