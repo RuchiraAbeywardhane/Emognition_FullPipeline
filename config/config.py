@@ -82,10 +82,10 @@ CFG: dict = {
         # Map the raw string labels in the dataset to integer class indices.
         # Add / remove entries to match your annotation scheme.
         "label_map": {
-            "happiness": 0,
-            "sadness":   1,
-            "fear":      2,
-            "neutral":   3,
+            "enthusiasm": 0,
+            "sadness":    1,
+            "fear":       2,
+            "neutral":    3,
         },
 
         # Number of emotion classes (must match len(label_map))
@@ -379,7 +379,7 @@ class _Config:
     # Emotion → superclass mapping
     # Keys must match the second "_"-delimited part of each filename (upper-cased)
     SUPERCLASS_MAP = {
-        "HAPPINESS": "happiness",
+        "ENTHUSIASM": "enthusiasm",
         "SADNESS":   "sadness",
         "FEAR":      "fear",
         "NEUTRAL":   "neutral",
